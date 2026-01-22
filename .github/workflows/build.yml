@@ -25,17 +25,48 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
       
-      - name: Download Spigot API
+      - name: Download Spigot API using Maven
         run: |
           mkdir -p libs
-          wget -O libs/spigot-api.jar https://repo.papermc.io/repository/maven-public/org/spigotmc/spigot-api/1.21-R0.1-SNAPSHOT/spigot-api-1.21-R0.1-20240626.201554-99.jar
+          cat << 'EOF' > pom.xml
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>temp</groupId>
+              <artifactId>temp</artifactId>
+              <version>1.0</version>
+              <repositories>
+                  <repository>
+                      <id>spigot-repo</id>
+                      <url>https://hub.spigotmc.org/nexus/content/repositories/snapshots/</url>
+                  </repository>
+              </repositories>
+              <dependencies>
+                  <dependency>
+                      <groupId>org.spigotmc</groupId>
+                      <artifactId>spigot-api</artifactId>
+                      <version>1.21-R0.1-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+          </project>
+          EOF
+          mvn dependency:copy-dependencies -DoutputDirectory=libs
+          rm pom.xml
+      
+      - name: Find Spigot API JAR
+        run: |
+          SPIGOT_JAR=$(find libs -name "spigot-api-*.jar" | head -n 1)
+          echo "SPIGOT_API=$SPIGOT_JAR" >> $GITHUB_ENV
       
       - name: Create build directory
         run: mkdir -p build/classes
       
       - name: Compile Java files
         run: |
-          javac -cp "libs/spigot-api.jar" -d build/classes src/main/java/org/freeroot.java
+          javac -cp "$SPIGOT_API" -d build/classes src/main/java/org/freeroot.java
       
       - name: Create plugin.yml
         run: |
@@ -84,7 +115,7 @@ jobs:
       - name: Create Release Notes
         run: |
           cat << EOF > notes.md
-          ## Build
+          ## Freeroot Plugin Build
           
           **Build Time:** ${{ steps.version.outputs.date }}
           **Commit:** \`${{ steps.commit_info.outputs.sha_short }}\`
