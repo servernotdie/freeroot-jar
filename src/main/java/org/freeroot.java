@@ -1,6 +1,6 @@
 //Make by mytai
 //My repo(https://github.com/Mytai20100/freeroot-jar)
-//Version v1.5
+//Version v1.6
 package org;
 
 import org.bukkit.ChatColor;
