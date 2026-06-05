@@ -1,5 +1,5 @@
 name: freeroot
-version: 'v1.6-SNAPSHOT'
+version: 'v1.6.1'
 main: org.freeroot
 api-version: '1.21'
 description: freeroot =0

